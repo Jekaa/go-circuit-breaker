@@ -16,7 +16,7 @@
 ## 🚀 Установка
 
 ```bash
-go get github.com/yourusername/circuitbreaker
+go get github.com/Jekaa/go-circuit-breaker
 ```
 
 ## 📖 Использование
