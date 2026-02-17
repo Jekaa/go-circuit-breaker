@@ -98,6 +98,8 @@ type SimpleFallbackCache struct {
 	maxSize int
 	ttl     time.Duration
 	expires map[string]time.Time
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
 func NewSimpleFallbackCache(maxSize int, ttl time.Duration) *SimpleFallbackCache {
@@ -106,33 +108,52 @@ func NewSimpleFallbackCache(maxSize int, ttl time.Duration) *SimpleFallbackCache
 		maxSize: maxSize,
 		ttl:     ttl,
 		expires: make(map[string]time.Time),
+		stopCh:  make(chan struct{}),
 	}
 
 	// Запускаем горутину для очистки устаревших записей
+	cache.wg.Add(1)
 	go cache.cleanup()
 
 	return cache
 }
 
-func (c *SimpleFallbackCache) Get(req Request) (Response, bool) {
+func (c *SimpleFallbackCache) Stop() {
+	close(c.stopCh)
+	c.wg.Wait()
+}
+
+func (c *SimpleFallbackCache) Get(key interface{}) (interface{}, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	key := req.(string)
-	expiry, ok := c.expires[key]
+	strKey, ok := key.(string)
+	if !ok {
+		return nil, false
+	}
+
+	expiry, ok := c.expires[strKey]
 	if !ok || time.Now().After(expiry) {
 		return nil, false
 	}
 
-	val, ok := c.data[key]
+	val, ok := c.data[strKey]
 	return val, ok
 }
 
-func (c *SimpleFallbackCache) Set(req Request, resp Response) {
+func (c *SimpleFallbackCache) Set(key, value interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	key := req.(string)
+	strKey, ok := key.(string)
+	if !ok {
+		return
+	}
+
+	strVal, ok := value.(string)
+	if !ok {
+		return
+	}
 
 	// Если достигнут лимит, удаляем самую старую запись
 	if len(c.data) >= c.maxSize {
@@ -150,24 +171,31 @@ func (c *SimpleFallbackCache) Set(req Request, resp Response) {
 		delete(c.expires, oldestKey)
 	}
 
-	c.data[key] = resp.(string)
-	c.expires[key] = time.Now().Add(c.ttl)
+	c.data[strKey] = strVal
+	c.expires[strKey] = time.Now().Add(c.ttl)
 }
 
 func (c *SimpleFallbackCache) cleanup() {
+	defer c.wg.Done()
+
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now()
-		for key, expiry := range c.expires {
-			if now.After(expiry) {
-				delete(c.data, key)
-				delete(c.expires, key)
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			now := time.Now()
+			for key, expiry := range c.expires {
+				if now.After(expiry) {
+					delete(c.data, key)
+					delete(c.expires, key)
+				}
 			}
+			c.mu.Unlock()
+		case <-c.stopCh:
+			return
 		}
-		c.mu.Unlock()
 	}
 }
 
@@ -177,28 +205,39 @@ type SimpleMetricsCollector struct {
 	errors    []time.Time
 	successes []time.Time
 	retention time.Duration
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
 }
 
 func NewSimpleMetricsCollector(retention time.Duration) *SimpleMetricsCollector {
-	return &SimpleMetricsCollector{
+	m := &SimpleMetricsCollector{
 		errors:    make([]time.Time, 0),
 		successes: make([]time.Time, 0),
 		retention: retention,
+		stopCh:    make(chan struct{}),
 	}
+
+	m.wg.Add(1)
+	go m.cleanupLoop()
+
+	return m
+}
+
+func (m *SimpleMetricsCollector) Stop() {
+	close(m.stopCh)
+	m.wg.Wait()
 }
 
 func (m *SimpleMetricsCollector) RecordError() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.errors = append(m.errors, time.Now())
-	m.cleanup()
 }
 
 func (m *SimpleMetricsCollector) RecordSuccess() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.successes = append(m.successes, time.Now())
-	m.cleanup()
 }
 
 func (m *SimpleMetricsCollector) GetErrorRate() float64 {
@@ -247,14 +286,31 @@ func (m *SimpleMetricsCollector) cleanup() {
 	m.successes = successes
 }
 
-// Request и Response - алиасы для удобства
-type Request = circuitbreaker.Request
-type Response = circuitbreaker.Response
+func (m *SimpleMetricsCollector) cleanupLoop() {
+	defer m.wg.Done()
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.mu.Lock()
+			m.cleanup()
+			m.mu.Unlock()
+		case <-m.stopCh:
+			return
+		}
+	}
+}
 
 func main() {
 	// Инициализация компонентов
 	cache := NewSimpleFallbackCache(100, 5*time.Minute)
+	defer cache.Stop()
+
 	metrics := NewSimpleMetricsCollector(1 * time.Hour)
+	defer metrics.Stop()
 
 	// Настройка конфигурации Circuit Breaker
 	config := circuitbreaker.DefaultConfig()
@@ -264,14 +320,13 @@ func main() {
 	config.WindowSize = 50
 	config.MinRequests = 10
 	config.MaxConcurrentRequests = 3
-	config.HalfOpenBucketSize = 5
-	config.HalfOpenRefillRate = 2.0
 	config.AdaptiveThresholdFactor = 0.3
 	config.FallbackCache = cache
 	config.MetricsCollector = metrics
 
 	// Создаем Circuit Breaker
 	cb := circuitbreaker.NewCircuitBreaker(config)
+	defer cb.Stop()
 
 	// Создаем мок API клиента
 	api := NewMockAPIClient("payment-service")
@@ -284,9 +339,12 @@ func main() {
 	for i := 0; i < 20; i++ {
 		req := fmt.Sprintf("request-%d", i)
 
-		resp, err := cb.Execute(ctx, func() (Response, error) {
+		// Создаем замыкание для выполнения запроса
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
+		}
+
+		resp, err := cb.Execute(ctx, execFn)
 
 		if err != nil {
 			fmt.Printf("❌ Request %s failed: %v\n", req, err)
@@ -308,9 +366,11 @@ func main() {
 	for i := 20; i < 40; i++ {
 		req := fmt.Sprintf("request-%d", i)
 
-		resp, err := cb.Execute(ctx, func() (Response, error) {
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
+		}
+
+		resp, err := cb.Execute(ctx, execFn)
 
 		if err != nil {
 			fmt.Printf("❌ Request %s failed: %v\n", req, err)
@@ -336,9 +396,11 @@ func main() {
 		req := fmt.Sprintf("request-%d", i)
 
 		start := time.Now()
-		resp, err := cb.Execute(ctx, func() (Response, error) {
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
+		}
+
+		resp, err := cb.Execute(ctx, execFn)
 		elapsed := time.Since(start)
 
 		if err != nil {
@@ -362,9 +424,11 @@ func main() {
 	for i := 45; i < 60; i++ {
 		req := fmt.Sprintf("request-%d", i)
 
-		resp, err := cb.Execute(ctx, func() (Response, error) {
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
+		}
+
+		resp, err := cb.Execute(ctx, execFn)
 
 		if err != nil {
 			failCount++
@@ -404,9 +468,11 @@ func main() {
 			reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
 
-			resp, err := cb.Execute(reqCtx, func() (Response, error) {
-				return api.Call(reqCtx, req)
-			})
+			execFn := func(ctx context.Context) (interface{}, error) {
+				return api.Call(ctx, req)
+			}
+
+			resp, err := cb.Execute(reqCtx, execFn)
 
 			if err != nil {
 				fmt.Printf("  Goroutine %d: ❌ %v\n", id, err)
@@ -424,20 +490,28 @@ func main() {
 	// Демонстрация 6: Graceful degradation и адаптивный порог
 	fmt.Println("\n=== Демонстрация 6: Graceful degradation & Adaptive threshold ===")
 
-	// Очищаем кэш для демонстрации
-	cache = NewSimpleFallbackCache(100, 5*time.Minute)
-	config.FallbackCache = cache
-	cb = circuitbreaker.NewCircuitBreaker(config)
+	// Создаем новый Circuit Breaker для демонстрации
+	cache2 := NewSimpleFallbackCache(100, 5*time.Minute)
+	defer cache2.Stop()
+
+	config2 := circuitbreaker.DefaultConfig()
+	config2.FallbackCache = cache2
+	config2.MetricsCollector = metrics
+	config2.ErrorThreshold = 30.0
+
+	cb2 := circuitbreaker.NewCircuitBreaker(config2)
+	defer cb2.Stop()
 
 	// Сначала наполняем кэш успешными ответами
 	fmt.Println("Наполняем кэш успешными ответами...")
 	api.SetFailureRate(0.0)
 	for i := 0; i < 10; i++ {
 		req := fmt.Sprintf("cached-%d", i)
-		resp, _ := cb.Execute(ctx, func() (Response, error) {
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
-		cache.Set(req, resp)
+		}
+		resp, _ := cb2.Execute(ctx, execFn)
+		cache2.Set(req, resp)
 	}
 
 	// Теперь вызываем ошибки
@@ -445,9 +519,10 @@ func main() {
 	api.SetFailureRate(1.0) // 100% ошибок
 	for i := 10; i < 30; i++ {
 		req := fmt.Sprintf("cached-%d", i)
-		_, err := cb.Execute(ctx, func() (Response, error) {
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
+		}
+		_, err := cb2.Execute(ctx, execFn)
 		if err != nil {
 			return
 		}
@@ -457,9 +532,11 @@ func main() {
 	fmt.Println("Демонстрация fallback ответов из кэша:")
 	for i := 0; i < 5; i++ {
 		req := fmt.Sprintf("cached-%d", i)
-		resp, err := cb.Execute(ctx, func() (Response, error) {
+		execFn := func(ctx context.Context) (interface{}, error) {
 			return api.Call(ctx, req)
-		})
+		}
+
+		resp, err := cb2.Execute(ctx, execFn)
 
 		if err != nil {
 			fmt.Printf("Request %s failed: %v\n", req, err)
@@ -468,15 +545,33 @@ func main() {
 		}
 	}
 
-	printStats(cb, api)
+	printStats(cb2, api)
 
 	// Финальный отчет
 	fmt.Println("\n=== ФИНАЛЬНЫЙ ОТЧЕТ ===")
 	fmt.Printf("Circuit Breaker state: %s\n", cb.State())
 	m := cb.GetMetrics()
-	fmt.Printf("Metrics - Failures: %d, Successes: %d, Error Rate: %.2f%%, Available Tokens: %d\n",
-		m.Failures, m.Successes, m.ErrorRate, m.AvailableTokens)
+	fmt.Printf("Metrics - Failures: %d, Successes: %d, Error Rate: %.2f%%, Half-Open Requests: %d\n",
+		m.Failures, m.Successes, m.ErrorRate, m.HalfOpenRequests)
 	fmt.Printf("API Stats: %s\n", api.GetStats())
+
+	// Использование GenericCircuitBreaker
+	fmt.Println("\n=== Бонус: Generic Circuit Breaker ===")
+
+	// Создаем типизированный Circuit Breaker
+	genericCB := circuitbreaker.NewGenericCircuitBreaker(config2,
+		func(ctx context.Context, req string) (string, error) {
+			return api.Call(ctx, req)
+		})
+	defer genericCB.Stop()
+
+	// Используем типизированный вызов
+	resp, err := genericCB.Execute(ctx, "generic-request")
+	if err != nil {
+		fmt.Printf("Generic request failed: %v\n", err)
+	} else {
+		fmt.Printf("Generic request succeeded: %v\n", resp)
+	}
 }
 
 func printStats(cb *circuitbreaker.CircuitBreaker, api *MockAPIClient) {
@@ -486,7 +581,7 @@ func printStats(cb *circuitbreaker.CircuitBreaker, api *MockAPIClient) {
 	fmt.Printf("  Ошибки в окне: %d\n", metrics.Failures)
 	fmt.Printf("  Успехи: %d\n", metrics.Successes)
 	fmt.Printf("  Процент ошибок: %.2f%%\n", metrics.ErrorRate)
-	fmt.Printf("  Доступно токенов: %d\n", metrics.AvailableTokens)
+	fmt.Printf("  Half-Open запросов: %d\n", metrics.HalfOpenRequests)
 	fmt.Printf("  API Stats: %s\n", api.GetStats())
 	fmt.Println()
 }

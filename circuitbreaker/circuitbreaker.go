@@ -7,8 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/sync/semaphore"
+	"unsafe"
 )
 
 // State представляет состояние Circuit Breaker
@@ -36,27 +35,22 @@ func (s State) String() string {
 	}
 }
 
-// Request представляет запрос к внешнему сервису
-type Request interface{}
+// Определяем ошибки как переменные пакета
+var (
+	ErrCircuitOpen       = errors.New("circuit breaker is open")
+	ErrHalfOpenRateLimit = errors.New("half-open: rate limit exceeded")
+	ErrRequestTimeout    = errors.New("request timeout")
+)
 
-// Response представляет ответ от внешнего сервиса
-type Response interface{}
-
-// FallbackCache предоставляет интерфейс для хранения fallback ответов
-type FallbackCache interface {
-	// Get возвращает закэшированный ответ для запроса
-	Get(req Request) (Response, bool)
-	// Set сохраняет успешный ответ в кэш
-	Set(req Request, resp Response)
+// Внутренние интерфейсы (определены потребителем)
+type cache interface {
+	Get(interface{}) (interface{}, bool)
+	Set(interface{}, interface{})
 }
 
-// MetricsCollector собирает метрики для адаптивного порога
-type MetricsCollector interface {
-	// RecordError записывает ошибку
+type metricsCollector interface {
 	RecordError()
-	// RecordSuccess записывает успех
 	RecordSuccess()
-	// GetErrorRate возвращает среднюю частоту ошибок за последний час
 	GetErrorRate() float64
 }
 
@@ -80,20 +74,14 @@ type Config struct {
 	// Максимальное количество одновременных запросов в HalfOpen
 	MaxConcurrentRequests int64
 
-	// Размер bucket для токенов в HalfOpen
-	HalfOpenBucketSize int
-
-	// Скорость восстановления токенов (токенов в секунду)
-	HalfOpenRefillRate float64
-
 	// Коэффициент адаптивности порога (0-1)
 	AdaptiveThresholdFactor float64
 
 	// FallbackCache для graceful degradation
-	FallbackCache FallbackCache
+	FallbackCache cache
 
 	// Сборщик метрик для адаптивного порога
-	MetricsCollector MetricsCollector
+	MetricsCollector metricsCollector
 }
 
 // DefaultConfig возвращает конфигурацию по умолчанию
@@ -104,50 +92,38 @@ func DefaultConfig() Config {
 		WindowSize:              100,
 		MinRequests:             10,
 		MaxConcurrentRequests:   5,
-		HalfOpenBucketSize:      10,
-		HalfOpenRefillRate:      2.0,
 		AdaptiveThresholdFactor: 0.3,
 	}
 }
 
-// slidingWindow реализует скользящее окно для подсчета событий
+// slidingWindow реализует скользящее окно с атомарными операциями
 type slidingWindow struct {
-	mu      sync.Mutex
-	ring    *ring.Ring
-	size    int
-	current int64
+	values []int64
+	index  uint64
+	size   int
 }
 
 func newSlidingWindow(size int) *slidingWindow {
 	return &slidingWindow{
-		ring: ring.New(size),
-		size: size,
+		values: make([]int64, size),
+		size:   size,
 	}
 }
 
 func (sw *slidingWindow) Add(value int64) {
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-
-	sw.ring.Value = value
-	sw.ring = sw.ring.Next()
+	idx := atomic.AddUint64(&sw.index, 1) % uint64(sw.size)
+	atomic.StoreInt64(&sw.values[idx], value)
 }
 
 func (sw *slidingWindow) Sum() int64 {
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-
 	var sum int64
-	sw.ring.Do(func(v interface{}) {
-		if val, ok := v.(int64); ok {
-			sum += val
-		}
-	})
+	for i := 0; i < sw.size; i++ {
+		sum += atomic.LoadInt64(&sw.values[i])
+	}
 	return sum
 }
 
 // CircuitBreaker реализует паттерн автоматического выключателя
-// с адаптивным порогом и токен-бакетом для Half-Open состояния.
 type CircuitBreaker struct {
 	// Атомарные поля должны быть выравнены для 64-битных архитектур
 	state     int32
@@ -155,16 +131,13 @@ type CircuitBreaker struct {
 	successes int64
 
 	config        Config
-	failureWindow *slidingWindow
+	failureWindow unsafe.Pointer // *slidingWindow
 
 	// Таймер для открытого состояния
-	openTimer  *time.Timer
-	openExpiry time.Time
+	openExpiry atomic.Value // time.Time
 
 	// Управление Half-Open состоянием
-	semaphore   *semaphore.Weighted
-	tokenBucket chan struct{}
-	lastRefill  time.Time
+	requestCount int64 // атомарный счетчик запросов в Half-Open
 
 	// Метрики для адаптивного порога
 	historicalRates *ring.Ring
@@ -173,189 +146,205 @@ type CircuitBreaker struct {
 
 	// Канал для оповещения о смене состояния
 	stateChange chan State
+
+	// Контекст для управления жизненным циклом
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // NewCircuitBreaker создает новый экземпляр Circuit Breaker
 func NewCircuitBreaker(config Config) *CircuitBreaker {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	cb := &CircuitBreaker{
 		config:          config,
-		failureWindow:   newSlidingWindow(config.WindowSize),
-		semaphore:       semaphore.NewWeighted(config.MaxConcurrentRequests),
-		tokenBucket:     make(chan struct{}, config.HalfOpenBucketSize),
 		historicalRates: ring.New(24), // храним 24 часа метрик
 		stateChange:     make(chan State, 1),
+		cancel:          cancel,
 	}
 
-	// Инициализируем токен бакет
-	for i := 0; i < config.HalfOpenBucketSize; i++ {
-		cb.tokenBucket <- struct{}{}
-	}
-	cb.lastRefill = time.Now()
+	// Инициализируем окно ошибок
+	window := newSlidingWindow(config.WindowSize)
+	atomic.StorePointer(&cb.failureWindow, unsafe.Pointer(window))
 
-	// Запускаем горутину для refill токенов
-	go cb.refillTokenBucket()
+	// Инициализируем openExpiry нулевым временем
+	cb.openExpiry.Store(time.Time{})
+
+	// Запускаем фоновые горутины
+	cb.wg.Add(1)
+	go cb.monitorOpenState(ctx)
 
 	return cb
 }
 
-// State возвращает текущее состояние выключателя (атомарно)
+// Stop останавливает фоновые горутины
+func (cb *CircuitBreaker) Stop() {
+	cb.cancel()
+	cb.wg.Wait()
+}
+
+// State возвращает текущее состояние выключателя с проверкой таймаута
 func (cb *CircuitBreaker) State() State {
-	return State(atomic.LoadInt32(&cb.state))
+	state := State(atomic.LoadInt32(&cb.state))
+
+	// Проверяем истечение таймера для Open состояния
+	if state == StateOpen {
+		expiry := cb.openExpiry.Load().(time.Time)
+		if !expiry.IsZero() && time.Now().After(expiry) {
+			// Пытаемся переключиться в HalfOpen
+			if atomic.CompareAndSwapInt32(&cb.state, int32(StateOpen), int32(StateHalfOpen)) {
+				cb.notifyStateChange(StateHalfOpen)
+				return StateHalfOpen
+			}
+			// Если не удалось, читаем актуальное состояние
+			return State(atomic.LoadInt32(&cb.state))
+		}
+	}
+
+	return state
 }
 
 // setState атомарно меняет состояние
 func (cb *CircuitBreaker) setState(newState State) {
 	old := State(atomic.SwapInt32(&cb.state, int32(newState)))
 	if old != newState {
+		cb.notifyStateChange(newState)
+	}
+}
+
+func (cb *CircuitBreaker) notifyStateChange(state State) {
+	select {
+	case cb.stateChange <- state:
+	default:
+	}
+}
+
+// monitorOpenState отслеживает состояние Open и переключает в HalfOpen
+func (cb *CircuitBreaker) monitorOpenState(ctx context.Context) {
+	defer cb.wg.Done()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
 		select {
-		case cb.stateChange <- newState:
-		default:
+		case <-ticker.C:
+			state := State(atomic.LoadInt32(&cb.state))
+			if state == StateOpen {
+				expiry := cb.openExpiry.Load().(time.Time)
+				if !expiry.IsZero() && time.Now().After(expiry) {
+					atomic.CompareAndSwapInt32(&cb.state, int32(StateOpen), int32(StateHalfOpen))
+				}
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
 
 // Execute выполняет запрос через Circuit Breaker
-func (cb *CircuitBreaker) Execute(ctx context.Context, req Request) (Response, error) {
-	// Проверяем состояние перед выполнением
-	switch cb.State() {
+func (cb *CircuitBreaker) Execute(ctx context.Context, req interface{}) (interface{}, error) {
+	state := cb.State()
+
+	switch state {
 	case StateOpen:
-		// Проверяем, не пора ли перейти в Half-Open
-		if time.Now().After(cb.openExpiry) {
-			cb.setState(StateHalfOpen)
-		} else {
-			// Graceful degradation: пробуем вернуть закэшированный ответ
-			if cb.config.FallbackCache != nil {
-				if resp, ok := cb.config.FallbackCache.Get(req); ok {
-					return resp, nil
-				}
+		// Graceful degradation: пробуем вернуть закэшированный ответ
+		if cb.config.FallbackCache != nil {
+			if resp, ok := cb.config.FallbackCache.Get(req); ok {
+				return resp, nil
 			}
-			return nil, errors.New("circuit breaker is open")
 		}
+		return nil, ErrCircuitOpen
+
 	case StateHalfOpen:
-		// В Half-Open используем семафор и токен бакет для контроля
-		if err := cb.acquireHalfOpenToken(ctx); err != nil {
-			// Не можем получить токен или семафор - возвращаем fallback
+		// Лимитируем количество одновременных запросов в HalfOpen
+		count := atomic.AddInt64(&cb.requestCount, 1)
+		defer atomic.AddInt64(&cb.requestCount, -1)
+
+		if count > cb.config.MaxConcurrentRequests {
 			if cb.config.FallbackCache != nil {
 				if resp, ok := cb.config.FallbackCache.Get(req); ok {
 					return resp, nil
 				}
 			}
-			return nil, errors.New("half-open: rate limit exceeded")
+			return nil, ErrHalfOpenRateLimit
 		}
-		defer cb.releaseHalfOpenToken()
+
+		// Выполняем запрос в HalfOpen
+		resp, err := cb.doRequest(ctx, req)
+		cb.recordHalfOpenResult(err)
+		return resp, err
+
 	case StateClosed:
-		// В закрытом состоянии запросы выполняются без ограничений
-		// Просто выполняем запрос и записываем результат
+		fallthrough
+	default:
+		// В закрытом состоянии выполняем запрос
 		resp, err := cb.doRequest(ctx, req)
 		cb.recordResult(err)
 		return resp, err
 	}
-
-	// Выполняем запрос (здесь должна быть реальная бизнес-логика)
-	resp, err := cb.doRequest(ctx, req)
-
-	// Обрабатываем результат
-	cb.recordResult(err)
-
-	return resp, err
 }
 
-// acquireHalfOpenToken пытается получить доступ в Half-Open состоянии
-func (cb *CircuitBreaker) acquireHalfOpenToken(ctx context.Context) error {
-	// Сначала пробуем взять семафор (конкурентность)
-	if err := cb.semaphore.Acquire(ctx, 1); err != nil {
-		return err
-	}
-
-	// Затем пробуем взять токен из бакета (rate limiting)
-	select {
-	case <-cb.tokenBucket:
-		return nil
-	case <-ctx.Done():
-		cb.semaphore.Release(1)
-		return ctx.Err()
-	default:
-		cb.semaphore.Release(1)
-		return errors.New("no tokens available")
-	}
-}
-
-// releaseHalfOpenToken освобождает ресурсы после запроса в Half-Open
-func (cb *CircuitBreaker) releaseHalfOpenToken() {
-	cb.semaphore.Release(1)
-	// Токен не возвращаем - он восстановится через refill
-}
-
-// refillTokenBucket периодически пополняет бакет токенов
-func (cb *CircuitBreaker) refillTokenBucket() {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		cb.mu.Lock()
-		now := time.Now()
-		elapsed := now.Sub(cb.lastRefill).Seconds()
-		tokensToAdd := int(elapsed * cb.config.HalfOpenRefillRate)
-
-		if tokensToAdd > 0 {
-			for i := 0; i < tokensToAdd; i++ {
-				select {
-				case cb.tokenBucket <- struct{}{}:
-				default:
-					// Бакет полон, выходим
-					break
-				}
-			}
-			cb.lastRefill = now
-		}
-		cb.mu.Unlock()
-	}
-}
-
-// recordResult анализирует результат запроса и обновляет состояние
-func (cb *CircuitBreaker) recordResult(err error) {
+// recordHalfOpenResult анализирует результат в HalfOpen состоянии
+func (cb *CircuitBreaker) recordHalfOpenResult(err error) {
 	if err == nil {
-		atomic.AddInt64(&cb.successes, 1)
-		cb.failureWindow.Add(0)
-
-		// В Half-Open успех может закрыть выключатель
-		if cb.State() == StateHalfOpen {
-			successes := atomic.LoadInt64(&cb.successes)
-			if successes >= int64(cb.config.MinRequests/2) {
-				cb.reset()
-			}
+		successes := atomic.AddInt64(&cb.successes, 1)
+		// Если достаточно успехов, закрываем выключатель
+		if successes >= int64(cb.config.MinRequests/2) {
+			cb.reset()
 		}
 	} else {
-		atomic.AddInt64(&cb.failures, 1)
-		cb.failureWindow.Add(1)
+		// Любая ошибка в HalfOpen возвращает в Open
+		failures := atomic.AddInt64(&cb.failures, 1)
+		if failures >= 1 {
+			cb.open()
+		}
+	}
 
-		// Обновляем метрики для адаптивного порога
+	// Обновляем метрики
+	if cb.config.MetricsCollector != nil && err != nil {
+		cb.config.MetricsCollector.RecordError()
+	}
+}
+
+// recordResult анализирует результат запроса в Closed состоянии
+func (cb *CircuitBreaker) recordResult(err error) {
+	window := (*slidingWindow)(atomic.LoadPointer(&cb.failureWindow))
+
+	if err == nil {
+		atomic.AddInt64(&cb.successes, 1)
+		window.Add(0)
+	} else {
+		atomic.AddInt64(&cb.failures, 1)
+		window.Add(1)
+
+		// Обновляем метрики
 		if cb.config.MetricsCollector != nil {
 			cb.config.MetricsCollector.RecordError()
 		}
 
-		// Проверяем, не пора ли открыть выключатель
-		cb.checkThreshold()
+		// Асинхронная проверка порога
+		go cb.checkThresholdAsync()
 	}
 }
 
-// checkThreshold проверяет порог ошибок и при необходимости открывает выключатель
-func (cb *CircuitBreaker) checkThreshold() {
-	if cb.State() != StateClosed {
+// checkThresholdAsync асинхронно проверяет порог ошибок
+func (cb *CircuitBreaker) checkThresholdAsync() {
+	if State(atomic.LoadInt32(&cb.state)) != StateClosed {
 		return
 	}
 
-	failures := cb.failureWindow.Sum()
+	window := (*slidingWindow)(atomic.LoadPointer(&cb.failureWindow))
+	failures := window.Sum()
 	total := atomic.LoadInt64(&cb.successes) + failures
 
-	// Недостаточно данных для принятия решения
 	if total < int64(cb.config.MinRequests) {
 		return
 	}
 
 	errorRate := float64(failures) / float64(total) * 100
 
-	// Адаптивный порог: учитываем исторические данные
+	// Адаптивный порог
 	adaptiveThreshold := cb.config.ErrorThreshold
 	if cb.config.MetricsCollector != nil {
 		historicalRate := cb.config.MetricsCollector.GetErrorRate()
@@ -370,36 +359,47 @@ func (cb *CircuitBreaker) checkThreshold() {
 
 // open переводит выключатель в открытое состояние
 func (cb *CircuitBreaker) open() {
+	// Пытаемся переключиться в Open, только если не в Open уже
+	if !atomic.CompareAndSwapInt32(&cb.state, int32(StateClosed), int32(StateOpen)) {
+		return
+	}
+
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	cb.setState(StateOpen)
-	cb.openExpiry = time.Now().Add(cb.config.OpenTimeout)
+	cb.openExpiry.Store(time.Now().Add(cb.config.OpenTimeout))
 
-	// Сбрасываем счетчики для Half-Open
+	// Сбрасываем счетчики
 	atomic.StoreInt64(&cb.successes, 0)
 	atomic.StoreInt64(&cb.failures, 0)
+
+	cb.notifyStateChange(StateOpen)
 }
 
 // reset закрывает выключатель (возвращает в нормальное состояние)
 func (cb *CircuitBreaker) reset() {
+	if !atomic.CompareAndSwapInt32(&cb.state, int32(StateHalfOpen), int32(StateClosed)) {
+		return
+	}
+
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	cb.setState(StateClosed)
+	// Создаем новое окно ошибок
+	newWindow := newSlidingWindow(cb.config.WindowSize)
+	atomic.StorePointer(&cb.failureWindow, unsafe.Pointer(newWindow))
+
 	atomic.StoreInt64(&cb.successes, 0)
 	atomic.StoreInt64(&cb.failures, 0)
 
-	// Очищаем окно ошибок
-	cb.failureWindow = newSlidingWindow(cb.config.WindowSize)
+	cb.notifyStateChange(StateClosed)
 }
 
-// doRequest имитирует выполнение запроса (в реальном приложении здесь будет вызов API)
-func (cb *CircuitBreaker) doRequest(ctx context.Context, req Request) (Response, error) {
-	// Эмуляция работы с внешним сервисом
+// doRequest имитирует выполнение запроса
+func (cb *CircuitBreaker) doRequest(ctx context.Context, req interface{}) (interface{}, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, ErrRequestTimeout
 	case <-time.After(100 * time.Millisecond):
 		// В реальном коде здесь будет вызов API
 		return "success", nil
@@ -408,33 +408,104 @@ func (cb *CircuitBreaker) doRequest(ctx context.Context, req Request) (Response,
 
 // Metrics содержит метрики Circuit Breaker
 type Metrics struct {
-	State           State
-	Failures        int64
-	Successes       int64
-	ErrorRate       float64
-	OpenExpiry      time.Time
-	AvailableTokens int
+	State            State
+	Failures         int64
+	Successes        int64
+	ErrorRate        float64
+	OpenExpiry       time.Time
+	HalfOpenRequests int64
 }
 
 // GetMetrics возвращает текущие метрики выключателя
 func (cb *CircuitBreaker) GetMetrics() Metrics {
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
-
-	failures := cb.failureWindow.Sum()
-	total := atomic.LoadInt64(&cb.successes) + failures
+	window := (*slidingWindow)(atomic.LoadPointer(&cb.failureWindow))
+	failures := window.Sum()
+	successes := atomic.LoadInt64(&cb.successes)
+	total := successes + failures
 
 	var errorRate float64
 	if total > 0 {
 		errorRate = float64(failures) / float64(total) * 100
 	}
 
+	expiry := cb.openExpiry.Load().(time.Time)
+
 	return Metrics{
-		State:           cb.State(),
-		Failures:        failures,
-		Successes:       atomic.LoadInt64(&cb.successes),
-		ErrorRate:       errorRate,
-		OpenExpiry:      cb.openExpiry,
-		AvailableTokens: len(cb.tokenBucket),
+		State:            cb.State(),
+		Failures:         failures,
+		Successes:        successes,
+		ErrorRate:        errorRate,
+		OpenExpiry:       expiry,
+		HalfOpenRequests: atomic.LoadInt64(&cb.requestCount),
+	}
+}
+
+// GenericCircuitBreaker - обобщенная версия с типами
+type GenericCircuitBreaker[T any, R any] struct {
+	*CircuitBreaker
+	executor func(context.Context, T) (R, error)
+}
+
+// NewGenericCircuitBreaker создает типизированный Circuit Breaker
+func NewGenericCircuitBreaker[T any, R any](
+	config Config,
+	executor func(context.Context, T) (R, error),
+) *GenericCircuitBreaker[T, R] {
+	return &GenericCircuitBreaker[T, R]{
+		CircuitBreaker: NewCircuitBreaker(config),
+		executor:       executor,
+	}
+}
+
+// Execute выполняет типизированный запрос
+func (gcb *GenericCircuitBreaker[T, R]) Execute(ctx context.Context, req T) (R, error) {
+	var zero R
+
+	state := gcb.State()
+
+	switch state {
+	case StateOpen:
+		if gcb.config.FallbackCache != nil {
+			if resp, ok := gcb.config.FallbackCache.Get(req); ok {
+				if typedResp, ok := resp.(R); ok {
+					return typedResp, nil
+				}
+			}
+		}
+		return zero, ErrCircuitOpen
+
+	case StateHalfOpen:
+		count := atomic.AddInt64(&gcb.requestCount, 1)
+		defer atomic.AddInt64(&gcb.requestCount, -1)
+
+		if count > gcb.config.MaxConcurrentRequests {
+			if gcb.config.FallbackCache != nil {
+				if resp, ok := gcb.config.FallbackCache.Get(req); ok {
+					if typedResp, ok := resp.(R); ok {
+						return typedResp, nil
+					}
+				}
+			}
+			return zero, ErrHalfOpenRateLimit
+		}
+
+		resp, err := gcb.executor(ctx, req)
+		if err == nil {
+			if gcb.config.FallbackCache != nil {
+				gcb.config.FallbackCache.Set(req, resp)
+			}
+		}
+		gcb.recordHalfOpenResult(err)
+		return resp, err
+
+	default:
+		resp, err := gcb.executor(ctx, req)
+		if err == nil {
+			if gcb.config.FallbackCache != nil {
+				gcb.config.FallbackCache.Set(req, resp)
+			}
+		}
+		gcb.recordResult(err)
+		return resp, err
 	}
 }
